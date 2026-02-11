@@ -5,15 +5,29 @@
 #include <WebServer.h>
 #include <Update.h>
 
-// Select eye texture set: 0 = human defaultEye, 1 = dragonEye.
-#ifndef EYE_STYLE_DRAGON
-#define EYE_STYLE_DRAGON 0
+// Select eye texture set by numeric id (Animated_Eyes style):
+// 1=default, 2=dragon, 3=cat, 4=doe, 5=goat
+#ifndef EYE_STYLE_ID
+#define EYE_STYLE_ID 1
 #endif
 
-#if EYE_STYLE_DRAGON
-#include "dragonEye.h"
-#else
+#if EYE_STYLE_ID == 1
 #include "defaultEye.h"
+#define EYE_STYLE_NAME "default"
+#elif EYE_STYLE_ID == 2
+#include "dragonEye.h"
+#define EYE_STYLE_NAME "dragon"
+#elif EYE_STYLE_ID == 3
+#include "catEye.h"
+#define EYE_STYLE_NAME "cat"
+#elif EYE_STYLE_ID == 4
+#include "doeEye.h"
+#define EYE_STYLE_NAME "doe"
+#elif EYE_STYLE_ID == 5
+#include "goatEye.h"
+#define EYE_STYLE_NAME "goat"
+#else
+#error Unsupported EYE_STYLE_ID (use 1..5)
 #endif
 
 // Confirmed wiring:
@@ -36,9 +50,18 @@ static constexpr int DISPLAY_WIDTH  = 128;
 static constexpr int DISPLAY_HEIGHT = 160;
 static constexpr int EYE_Y_OFFSET   = (DISPLAY_HEIGHT - SCREEN_HEIGHT) / 2;
 
-// Eye behavior tuning (matched close to original animated-eyes feel)
-static constexpr int IRIS_MIN = 90;
-static constexpr int IRIS_MAX = 130;
+// Eye behavior tuning (matched close to original animated-eyes feel).
+// Some eye headers define IRIS_MIN/IRIS_MAX; use those when present.
+#ifdef IRIS_MIN
+static constexpr int IRIS_MIN_VAL = IRIS_MIN;
+#else
+static constexpr int IRIS_MIN_VAL = 90;
+#endif
+#ifdef IRIS_MAX
+static constexpr int IRIS_MAX_VAL = IRIS_MAX;
+#else
+static constexpr int IRIS_MAX_VAL = 130;
+#endif
 static constexpr int CONVERGENCE_PX = 0;
 static constexpr float EYE_POS_SMOOTH = 0.48f;
 static constexpr int LEFT_X_OFFSET = 0;
@@ -101,22 +124,48 @@ struct BlinkTracker {
 static GazeState gaze;
 static BlinkTracker blink;
 
-static float irisScale = (IRIS_MIN + IRIS_MAX) * 0.5f;
-static float irisTarget = (IRIS_MIN + IRIS_MAX) * 0.5f;
+static float irisScale = (IRIS_MIN_VAL + IRIS_MAX_VAL) * 0.5f;
+static float irisTarget = (IRIS_MIN_VAL + IRIS_MAX_VAL) * 0.5f;
 static uint32_t nextIrisMs = 0;
 
 static uint8_t trackedUpper[2] = {128, 128};
 static float smoothBaseSx = -1.0f;
 static float smoothBaseSy = -1.0f;
 
-static const char* kOtaFormHtml =
-  "<!doctype html><html><body style='font-family:Arial'>"
-  "<h2>ESP32 Eyes OTA</h2>"
-  "<p>Upload firmware .bin</p>"
-  "<form method='POST' action='/update' enctype='multipart/form-data'>"
-  "<input type='file' name='firmware' accept='.bin' required>"
-  "<input type='submit' value='Update'>"
-  "</form></body></html>";
+static String buildOtaFormHtml() {
+  String html;
+  html.reserve(2200);
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>ESP32 Eyes OTA</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:620px;margin:20px auto;padding:0 12px;}";
+  html += "code{background:#f2f2f2;padding:2px 5px;border-radius:4px;}li{margin:6px 0;}</style>";
+  html += "</head><body>";
+  html += "<h2>ESP32 Eyes OTA</h2>";
+  html += "<p><b>Current style:</b> ";
+  html += EYE_STYLE_NAME;
+  html += " (";
+  html += String((int)EYE_STYLE_ID);
+  html += ")</p>";
+  html += "<p>Upload a prebuilt firmware <code>.bin</code>:</p>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  html += "<input type='file' name='firmware' accept='.bin' required>";
+  html += "<input type='submit' value='Update'>";
+  html += "</form>";
+  html += "<hr><p><b>Style mapping (build-time):</b></p><ul>";
+  html += "<li>1 = default (<code>esp32s3-eyes</code>)</li>";
+  html += "<li>2 = dragon (<code>esp32s3-eyes-2</code>)</li>";
+  html += "<li>3 = cat (<code>esp32s3-eyes-3</code>)</li>";
+  html += "<li>4 = doe (<code>esp32s3-eyes-4</code>)</li>";
+  html += "<li>5 = goat (<code>esp32s3-eyes-5</code>)</li>";
+  html += "</ul>";
+  html += "<p>Tip: from repo root run ";
+  html += "<code>tools\\ota_style_upload.ps1 -Style 3 -Device ";
+  html += WiFi.isConnected() ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  html += "</code></p>";
+  html += "</body></html>";
+  return html;
+}
 
 static inline int16_t clampi16(int32_t v, int16_t lo, int16_t hi) {
   if (v < lo) return lo;
@@ -153,7 +202,19 @@ static void configureDisplay(uint8_t eyeIndex, uint8_t rotation, bool invertColo
 
 static void setupOtaRoutes() {
   otaServer.on("/", HTTP_GET, []() {
-    otaServer.send(200, "text/html", kOtaFormHtml);
+    otaServer.send(200, "text/html", buildOtaFormHtml());
+  });
+
+  otaServer.on("/status", HTTP_GET, []() {
+    String ip = WiFi.isConnected() ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    String json = "{\"style_id\":";
+    json += String((int)EYE_STYLE_ID);
+    json += ",\"style_name\":\"";
+    json += EYE_STYLE_NAME;
+    json += "\",\"ip\":\"";
+    json += ip;
+    json += "\"}";
+    otaServer.send(200, "application/json", json);
   });
 
   otaServer.on("/update", HTTP_POST,
@@ -314,13 +375,13 @@ static void updateIris() {
   const uint32_t nowMs = millis();
 
   if (nowMs >= nextIrisMs) {
-    irisTarget = (float)random(IRIS_MIN, IRIS_MAX + 1);
+    irisTarget = (float)random(IRIS_MIN_VAL, IRIS_MAX_VAL + 1);
     nextIrisMs = nowMs + (uint32_t)random(450, 1800);
   }
 
   irisScale += (irisTarget - irisScale) * 0.16f;
-  if (irisScale < IRIS_MIN) irisScale = IRIS_MIN;
-  if (irisScale > IRIS_MAX) irisScale = IRIS_MAX;
+  if (irisScale < IRIS_MIN_VAL) irisScale = IRIS_MIN_VAL;
+  if (irisScale > IRIS_MAX_VAL) irisScale = IRIS_MAX_VAL;
 }
 
 static void computeEyelidThresholds(
@@ -436,7 +497,7 @@ void setup() {
   Serial.printf("Rot: L=%u R=%u mirror(Lx,Ly,Rx,Ry)=(%d,%d,%d,%d) eyeStyle=%s\n",
                 LEFT_ROTATION, RIGHT_ROTATION,
                 LEFT_MIRROR_X, LEFT_MIRROR_Y, RIGHT_MIRROR_X, RIGHT_MIRROR_Y,
-                EYE_STYLE_DRAGON ? "dragon" : "default");
+                EYE_STYLE_NAME);
 
   randomSeed((uint32_t)esp_random());
 
