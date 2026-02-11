@@ -2,6 +2,10 @@
     // See http://go.microsoft.com/fwlink/?LinkId=827846
     // for the documentation about the extensions.json format
     "recommendations": [
+        "donjayamanne.githistory",
+        "google.geminicodeassist",
+        "moonshot-ai.kimi-code",
+        "openai.chatgpt",
         "platformio.platformio-ide"
     ],
     "unwantedRecommendations": [
