@@ -32,8 +32,15 @@
 
 // Confirmed wiring:
 // TFT_MOSI=7, TFT_SCLK=6, TFT_DC=5, TFT_RST=4, TFT_CS=-1 (manual CS)
-#define CS_LEFT  16
-#define CS_RIGHT 8
+#ifndef CS_LEFT_PIN
+#define CS_LEFT_PIN 16
+#endif
+#ifndef CS_RIGHT_PIN
+#define CS_RIGHT_PIN 8
+#endif
+
+static constexpr int8_t CS_LEFT  = CS_LEFT_PIN;
+static constexpr int8_t CS_RIGHT = CS_RIGHT_PIN;
 
 static constexpr uint8_t LEFT_ROTATION  = 3;
 static constexpr uint8_t RIGHT_ROTATION = 1;
@@ -76,6 +83,8 @@ static constexpr bool EYELID_TRACKING = true;
 static constexpr bool SWAP_PIXEL_BYTES = true;
 
 static constexpr uint16_t PIXEL_BUFFER_SIZE = 1024;
+static constexpr bool TRI_STATE_INACTIVE_CS = false;
+static constexpr uint16_t CS_SETTLE_US = 12;
 
 TFT_eSPI tft;
 static uint16_t pixelBuffer[PIXEL_BUFFER_SIZE];
@@ -83,11 +92,49 @@ static WebServer otaServer(80);
 static bool otaUploadInProgress = false;
 static bool otaEnabled = false;
 
+enum RenderMode : uint8_t {
+  RENDER_BOTH = 0,
+  RENDER_LEFT_ONLY = 1,
+  RENDER_RIGHT_ONLY = 2,
+};
+static RenderMode renderMode = RENDER_BOTH;
+
+#ifndef CS_DIAG_LOG
+#define CS_DIAG_LOG 1
+#endif
+
+struct CsDiagState {
+  uint32_t selectCount[2] = {0, 0};
+  uint32_t drawCount[2] = {0, 0};
+  uint8_t lastSelectedEye = 255;
+  uint8_t lastCsLeftLevel = 1;
+  uint8_t lastCsRightLevel = 1;
+  uint32_t lastSelectUs = 0;
+  uint32_t lastReportMs = 0;
+};
+
+static CsDiagState csDiag;
+
 #ifndef OTA_WIFI_SSID
 #define OTA_WIFI_SSID ""
 #endif
 #ifndef OTA_WIFI_PASS
 #define OTA_WIFI_PASS ""
+#endif
+#ifndef OTA_WIFI_STATIC_IP
+#define OTA_WIFI_STATIC_IP ""
+#endif
+#ifndef OTA_WIFI_STATIC_GW
+#define OTA_WIFI_STATIC_GW ""
+#endif
+#ifndef OTA_WIFI_STATIC_MASK
+#define OTA_WIFI_STATIC_MASK "255.255.255.0"
+#endif
+#ifndef OTA_WIFI_STATIC_DNS1
+#define OTA_WIFI_STATIC_DNS1 ""
+#endif
+#ifndef OTA_WIFI_STATIC_DNS2
+#define OTA_WIFI_STATIC_DNS2 ""
 #endif
 #ifndef OTA_AP_SSID
 #define OTA_AP_SSID "ESP32-EYES-OTA"
@@ -133,8 +180,11 @@ static float smoothBaseSx = -1.0f;
 static float smoothBaseSy = -1.0f;
 
 static String buildOtaFormHtml() {
+  const char *renderModeName =
+    (renderMode == RENDER_LEFT_ONLY) ? "left only" :
+    (renderMode == RENDER_RIGHT_ONLY) ? "right only" : "both";
   String html;
-  html.reserve(2200);
+  html.reserve(2800);
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>ESP32 Eyes OTA</title>";
@@ -147,6 +197,28 @@ static String buildOtaFormHtml() {
   html += " (";
   html += String((int)EYE_STYLE_ID);
   html += ")</p>";
+  html += "<p><b>Render mode:</b> ";
+  html += renderModeName;
+  html += "</p>";
+  html += "<form method='POST' action='/mode'>";
+  html += "<label>Draw target:</label> ";
+  html += "<select name='m'>";
+  html += "<option value='0'";
+  if (renderMode == RENDER_BOTH) html += " selected";
+  html += ">both</option>";
+  html += "<option value='1'";
+  if (renderMode == RENDER_LEFT_ONLY) html += " selected";
+  html += ">left only</option>";
+  html += "<option value='2'";
+  if (renderMode == RENDER_RIGHT_ONLY) html += " selected";
+  html += ">right only</option>";
+  html += "</select> ";
+  html += "<input type='submit' value='Apply'>";
+  html += "</form>";
+  html += "<form method='POST' action='/recover' style='margin-top:8px'>";
+  html += "<input type='submit' value='Recover Displays'>";
+  html += "</form>";
+  html += "<p style='font-size:12px'>Use left/right only to detect CS cross-talk ghosting.</p>";
   html += "<p>Upload a prebuilt firmware <code>.bin</code>:</p>";
   html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
   html += "<input type='file' name='firmware' accept='.bin' required>";
@@ -179,8 +251,11 @@ static inline uint16_t maybeSwap565(uint16_t c) {
 }
 
 static inline void deselectBoth() {
+  pinMode(CS_LEFT, OUTPUT);
+  pinMode(CS_RIGHT, OUTPUT);
   digitalWrite(CS_LEFT, HIGH);
   digitalWrite(CS_RIGHT, HIGH);
+  if (CS_SETTLE_US) delayMicroseconds(CS_SETTLE_US);
 }
 
 static inline int8_t eyeCsPin(uint8_t eyeIndex) {
@@ -188,8 +263,69 @@ static inline int8_t eyeCsPin(uint8_t eyeIndex) {
 }
 
 static inline void selectEye(uint8_t eyeIndex) {
-  deselectBoth();
-  digitalWrite(eyeCsPin(eyeIndex), LOW);
+  // Force a known-good state on both CS lines before selecting one panel.
+  pinMode(CS_LEFT, OUTPUT);
+  pinMode(CS_RIGHT, OUTPUT);
+  digitalWrite(CS_LEFT, HIGH);
+  digitalWrite(CS_RIGHT, HIGH);
+  if (CS_SETTLE_US) delayMicroseconds(CS_SETTLE_US);
+
+  const int8_t active = eyeCsPin(eyeIndex);
+  const int8_t inactive = (eyeIndex == 0) ? CS_RIGHT : CS_LEFT;
+
+  // Keep inactive panel unselected before changing active CS.
+  if (TRI_STATE_INACTIVE_CS) {
+    pinMode(inactive, INPUT_PULLUP);
+  } else {
+    pinMode(inactive, OUTPUT);
+    digitalWrite(inactive, HIGH);
+  }
+
+  pinMode(active, OUTPUT);
+  digitalWrite(active, HIGH);
+  if (CS_SETTLE_US) delayMicroseconds(CS_SETTLE_US);
+  digitalWrite(active, LOW);
+  if (CS_SETTLE_US) delayMicroseconds(CS_SETTLE_US);
+
+#if CS_DIAG_LOG
+  csDiag.selectCount[eyeIndex]++;
+  csDiag.lastSelectedEye = eyeIndex;
+  csDiag.lastSelectUs = micros();
+  csDiag.lastCsLeftLevel = (uint8_t)digitalRead(CS_LEFT);
+  csDiag.lastCsRightLevel = (uint8_t)digitalRead(CS_RIGHT);
+#endif
+}
+
+static void reportCsDiagIfDue() {
+#if CS_DIAG_LOG
+  const uint32_t nowMs = millis();
+  if ((nowMs - csDiag.lastReportMs) < 1000U) return;
+  csDiag.lastReportMs = nowMs;
+
+  static uint32_t prevSelectL = 0;
+  static uint32_t prevSelectR = 0;
+  static uint32_t prevDrawL = 0;
+  static uint32_t prevDrawR = 0;
+
+  const uint32_t dSelectL = csDiag.selectCount[0] - prevSelectL;
+  const uint32_t dSelectR = csDiag.selectCount[1] - prevSelectR;
+  const uint32_t dDrawL = csDiag.drawCount[0] - prevDrawL;
+  const uint32_t dDrawR = csDiag.drawCount[1] - prevDrawR;
+
+  prevSelectL = csDiag.selectCount[0];
+  prevSelectR = csDiag.selectCount[1];
+  prevDrawL = csDiag.drawCount[0];
+  prevDrawR = csDiag.drawCount[1];
+
+  Serial.printf(
+    "CS-DIAG mode=%u select/s(L,R)=%lu,%lu draw/s(L,R)=%lu,%lu levels(L,R)=%u,%u lastEye=%u lastUs=%lu\n",
+    (unsigned)renderMode,
+    (unsigned long)dSelectL, (unsigned long)dSelectR,
+    (unsigned long)dDrawL, (unsigned long)dDrawR,
+    (unsigned)csDiag.lastCsLeftLevel, (unsigned)csDiag.lastCsRightLevel,
+    (unsigned)csDiag.lastSelectedEye, (unsigned long)csDiag.lastSelectUs
+  );
+#endif
 }
 
 static void configureDisplay(uint8_t eyeIndex, uint8_t rotation, bool invertColors) {
@@ -198,6 +334,20 @@ static void configureDisplay(uint8_t eyeIndex, uint8_t rotation, bool invertColo
   tft.invertDisplay(invertColors);
   tft.fillScreen(TFT_BLACK);
   digitalWrite(eyeCsPin(eyeIndex), HIGH);
+}
+
+static void reinitDisplays(const char *reason) {
+  Serial.printf("Reinitializing displays (%s)\n", reason ? reason : "unknown");
+
+  // TFT_CS is disabled in TFT_eSPI, so both displays are selected for init.
+  digitalWrite(CS_LEFT, LOW);
+  digitalWrite(CS_RIGHT, LOW);
+  tft.init();
+  tft.fillScreen(TFT_BLACK);
+  deselectBoth();
+
+  configureDisplay(0, LEFT_ROTATION, LEFT_INVERT_COLORS);
+  configureDisplay(1, RIGHT_ROTATION, RIGHT_INVERT_COLORS);
 }
 
 static void setupOtaRoutes() {
@@ -211,10 +361,49 @@ static void setupOtaRoutes() {
     json += String((int)EYE_STYLE_ID);
     json += ",\"style_name\":\"";
     json += EYE_STYLE_NAME;
-    json += "\",\"ip\":\"";
+    json += "\",\"render_mode\":";
+    json += String((int)renderMode);
+    json += ",\"diag\":";
+    json += String((int)CS_DIAG_LOG);
+    json += ",\"sel_l\":";
+    json += String((unsigned long)csDiag.selectCount[0]);
+    json += ",\"sel_r\":";
+    json += String((unsigned long)csDiag.selectCount[1]);
+    json += ",\"draw_l\":";
+    json += String((unsigned long)csDiag.drawCount[0]);
+    json += ",\"draw_r\":";
+    json += String((unsigned long)csDiag.drawCount[1]);
+    json += ",\"ip\":\"";
     json += ip;
     json += "\"}";
     otaServer.send(200, "application/json", json);
+  });
+
+  otaServer.on("/mode", HTTP_POST, []() {
+    if (!otaServer.hasArg("m")) {
+      otaServer.send(400, "text/plain", "Missing mode");
+      return;
+    }
+    int m = otaServer.arg("m").toInt();
+    if (m < 0 || m > 2) {
+      otaServer.send(400, "text/plain", "Mode must be 0,1,2");
+      return;
+    }
+    renderMode = (RenderMode)m;
+    Serial.printf("Render mode changed to %d\n", m);
+    reinitDisplays("mode-change");
+    trackedUpper[0] = 128;
+    trackedUpper[1] = 128;
+    otaServer.sendHeader("Location", "/");
+    otaServer.send(303, "text/plain", "OK");
+  });
+
+  otaServer.on("/recover", HTTP_POST, []() {
+    reinitDisplays("manual-recover");
+    trackedUpper[0] = 128;
+    trackedUpper[1] = 128;
+    otaServer.sendHeader("Location", "/");
+    otaServer.send(303, "text/plain", "Recovered");
   });
 
   otaServer.on("/update", HTTP_POST,
@@ -260,9 +449,34 @@ static void setupOtaRoutes() {
 static void initOtaNetworking() {
   const char *staSsid = OTA_WIFI_SSID;
   const char *staPass = OTA_WIFI_PASS;
+  const char *staIpStr = OTA_WIFI_STATIC_IP;
+  const char *staGwStr = OTA_WIFI_STATIC_GW;
+  const char *staMaskStr = OTA_WIFI_STATIC_MASK;
+  const char *staDns1Str = OTA_WIFI_STATIC_DNS1;
+  const char *staDns2Str = OTA_WIFI_STATIC_DNS2;
 
   if (staSsid && strlen(staSsid) > 0) {
     WiFi.mode(WIFI_STA);
+
+    if (staIpStr && strlen(staIpStr) > 0) {
+      IPAddress ip, gw, mask, dns1, dns2;
+      bool okIp = ip.fromString(staIpStr);
+      bool okGw = gw.fromString((staGwStr && strlen(staGwStr) > 0) ? staGwStr : "0.0.0.0");
+      bool okMask = mask.fromString((staMaskStr && strlen(staMaskStr) > 0) ? staMaskStr : "255.255.255.0");
+      bool okDns1 = dns1.fromString((staDns1Str && strlen(staDns1Str) > 0) ? staDns1Str : "0.0.0.0");
+      bool okDns2 = dns2.fromString((staDns2Str && strlen(staDns2Str) > 0) ? staDns2Str : "0.0.0.0");
+
+      if (okIp && okGw && okMask && okDns1 && okDns2) {
+        if (!WiFi.config(ip, gw, mask, dns1, dns2)) {
+          Serial.println("OTA STA static IP config failed, using DHCP");
+        } else {
+          Serial.printf("OTA STA static IP request: %s\n", ip.toString().c_str());
+        }
+      } else {
+        Serial.println("OTA STA static IP parse failed, using DHCP");
+      }
+    }
+
     WiFi.begin(staSsid, staPass);
 
     uint32_t t0 = millis();
@@ -486,6 +700,9 @@ static void drawOneEye(
 
   tft.endWrite();
   digitalWrite(cs, HIGH);
+#if CS_DIAG_LOG
+  csDiag.drawCount[eyeIndex]++;
+#endif
 }
 
 void setup() {
@@ -498,6 +715,11 @@ void setup() {
                 LEFT_ROTATION, RIGHT_ROTATION,
                 LEFT_MIRROR_X, LEFT_MIRROR_Y, RIGHT_MIRROR_X, RIGHT_MIRROR_Y,
                 EYE_STYLE_NAME);
+#if CS_DIAG_LOG
+  Serial.println("CS diagnostics: ENABLED (1 line/sec)");
+#else
+  Serial.println("CS diagnostics: DISABLED");
+#endif
 
   randomSeed((uint32_t)esp_random());
 
@@ -505,15 +727,7 @@ void setup() {
   pinMode(CS_RIGHT, OUTPUT);
   deselectBoth();
 
-  // TFT_CS is disabled in TFT_eSPI, so both displays are selected for init.
-  digitalWrite(CS_LEFT, LOW);
-  digitalWrite(CS_RIGHT, LOW);
-  tft.init();
-  tft.fillScreen(TFT_BLACK);
-  deselectBoth();
-
-  configureDisplay(0, LEFT_ROTATION, LEFT_INVERT_COLORS);
-  configureDisplay(1, RIGHT_ROTATION, RIGHT_INVERT_COLORS);
+  reinitDisplays("boot");
 
   // Quick sanity color test so channel issues show immediately.
   fillDisplayColor(0, TFT_RED);
@@ -563,7 +777,17 @@ void loop() {
   int16_t baseSx = clampi16((int16_t)(smoothBaseSx + 0.5f), 0, SCLERA_WIDTH - SCREEN_WIDTH);
   int16_t baseSy = clampi16((int16_t)(smoothBaseSy + 0.5f), 0, SCLERA_HEIGHT - SCREEN_HEIGHT);
 
-  for (uint8_t eyeIndex = 0; eyeIndex < 2; ++eyeIndex) {
+  // Alternate draw order each frame so one panel is not always second.
+  static bool drawRightFirst = false;
+  uint8_t firstEye = drawRightFirst ? 1 : 0;
+  uint8_t secondEye = firstEye ^ 1;
+  drawRightFirst = !drawRightFirst;
+
+  for (uint8_t pass = 0; pass < 2; ++pass) {
+    uint8_t eyeIndex = (pass == 0) ? firstEye : secondEye;
+    if (renderMode == RENDER_LEFT_ONLY && eyeIndex != 0) continue;
+    if (renderMode == RENDER_RIGHT_ONLY && eyeIndex != 1) continue;
+
     int16_t sx = baseSx;
     int16_t sy = baseSy;
 
@@ -585,4 +809,6 @@ void loop() {
 
     drawOneEye(eyeIndex, (uint16_t)irisScale, sx, sy, uT, lT);
   }
+
+  reportCsDiagIfDue();
 }

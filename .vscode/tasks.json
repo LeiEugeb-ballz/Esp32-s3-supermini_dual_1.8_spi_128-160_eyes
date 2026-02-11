@@ -2,16 +2,39 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"type": "PlatformIO",
-			"task": "Monitor",
+			"label": "PIO: Upload esp32s3-eyes",
+			"type": "shell",
+			"command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"esp32s3-eyes",
+				"--target",
+				"upload",
+				"--upload-port",
+				"COM27"
+			],
 			"problemMatcher": [
 				"$platformio"
 			],
-			"label": "PlatformIO: Monitor",
 			"group": {
 				"kind": "build",
 				"isDefault": true
 			}
+		},
+		{
+			"label": "PIO: Monitor COM27",
+			"type": "shell",
+			"command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"device",
+				"monitor",
+				"-p",
+				"COM27",
+				"-b",
+				"115200"
+			],
+			"problemMatcher": []
 		}
 	]
 }

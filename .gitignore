@@ -4,3 +4,6 @@
 .vscode/launch.json
 .vscode/ipch
 src/defaultEye.h
+*.mp4
+safety_snapshot_*
+safety_snapshot_*.zip
