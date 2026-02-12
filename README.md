@@ -13,10 +13,10 @@ Dual 3D eye renderer for ESP32-S3 Supermini using 1.8" SPI TFT displays.
 |------|------|
 | RST | 4 |
 | DC | 5 |
-| CS (Left) | 6 |
-| CS (Right) | 7 |
-| SCK | 8 |
-| MOSI | 9 |
+| CS (Left) | 16 |
+| CS (Right) | 8 |
+| SCK | 6 |
+| MOSI | 7 |
 | BL | 3.3V |
 | VCC | 3.3V or 5V (module dependent) |
 | GND | GND |
