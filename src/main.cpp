@@ -48,7 +48,7 @@ static constexpr bool LEFT_INVERT_COLORS  = false;
 static constexpr bool RIGHT_INVERT_COLORS = false;
 
 // Mirror toggles. Left X mirror is enabled so left eye mirrors right eye motion.
-static constexpr bool LEFT_MIRROR_X = true;
+static constexpr bool LEFT_MIRROR_X = false;
 static constexpr bool LEFT_MIRROR_Y = false;
 static constexpr bool RIGHT_MIRROR_X = false;
 static constexpr bool RIGHT_MIRROR_Y = false;
@@ -85,6 +85,25 @@ static constexpr bool SWAP_PIXEL_BYTES = true;
 static constexpr uint16_t PIXEL_BUFFER_SIZE = 1024;
 static constexpr bool TRI_STATE_INACTIVE_CS = false;
 static constexpr uint16_t CS_SETTLE_US = 12;
+static constexpr bool RIGHT_EYE_DEBUG_MARK = true;
+static constexpr uint16_t RIGHT_EYE_DEBUG_MARK_COLOR = 0xF800; // Red
+
+static inline bool isRightEyeDebugMarkPixel(uint8_t eyeIndex, int16_t x, int16_t y) {
+  if (!RIGHT_EYE_DEBUG_MARK || eyeIndex != 0) return false;
+
+  // Small "popped blood vessel" style mark near the right eye pupil.
+  const int16_t cx = SCREEN_WIDTH / 2 + 8;
+  const int16_t cy = SCREEN_HEIGHT / 2 - 4;
+  const int16_t dx = x - cx;
+  const int16_t dy = y - cy;
+
+  const bool coreDot = (dx * dx + dy * dy) <= 2;
+  const bool horizontal = (dy == 0 && dx >= -6 && dx <= 3);
+  const bool diagUp = (dy == dx && dx >= -2 && dx <= 5);
+  const bool diagDown = (dy == -dx && dx >= -1 && dx <= 4);
+
+  return coreDot || horizontal || diagUp || diagDown;
+}
 
 TFT_eSPI tft;
 static uint16_t pixelBuffer[PIXEL_BUFFER_SIZE];
@@ -682,6 +701,10 @@ static void drawOneEye(
         } else {
           p = pgm_read_word(sclera + scleraYRow * SCLERA_WIDTH + scleraXCol);
         }
+      }
+
+      if (isRightEyeDebugMarkPixel(eyeIndex, x, y)) {
+        p = RIGHT_EYE_DEBUG_MARK_COLOR;
       }
 
       pixelBuffer[pixels++] = maybeSwap565(p);
